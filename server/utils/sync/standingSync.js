@@ -437,7 +437,43 @@ const resolveCompetitionIds = async (
       name: normalizeString(
         competition.name
       ),
+      currentSeason:
+        competition.currentSeason ||
+        competition.season ||
+        null,
     }));
+};
+
+const resolveCompetitionSeasons = async (
+  leagueId,
+  fallbackSeason = null
+) => {
+  const competitionPayload =
+    await withRetry(() =>
+      requestFootballApi(
+        `/competitions/${leagueId}`,
+        {}
+      )
+    );
+
+  const seasons = Array.isArray(
+    competitionPayload?.seasons
+  )
+    ? competitionPayload.seasons
+    : [];
+
+  const candidates = [
+    ...seasons.map((season) =>
+      getApplicationSeason(season)
+    ),
+    getApplicationSeason(
+      competitionPayload?.currentSeason ||
+        competitionPayload?.season ||
+        fallbackSeason
+    ),
+  ];
+
+  return [...new Set(candidates.filter(Boolean))];
 };
 
 /**
@@ -507,11 +543,6 @@ if (!competitions.length) {
       competition.id
     );
       try {
-        /*
-         * ---------------------------------------------------------
-         * 1. Competition metadata
-         * ---------------------------------------------------------
-         */
         const competitionPayload =
           await withRetry(
             () =>
@@ -536,61 +567,25 @@ if (!competitions.length) {
           );
         }
 
-        /*
-         * ---------------------------------------------------------
-         * 2. Resolve current season
-         * ---------------------------------------------------------
-         *
-         * IMPORTANT:
-         *
-         * Do NOT use seasonData.id.
-         *
-         * seasonData.id could be:
-         *
-         * 2474
-         * 2518
-         * 2497
-         *
-         * Those are provider internal season IDs.
-         *
-         * Our database uses:
-         *
-         * 2026
-         * 2026
-         * 2026
-         */
-        const seasonData =
-          competitionPayload
-            ?.currentSeason ||
-          competitionPayload
-            ?.season ||
-          null;
-
-        const season =
-          getApplicationSeason(
-            seasonData
+        const seasonOptions =
+          await resolveCompetitionSeasons(
+            leagueId,
+            competition.currentSeason
           );
 
-        if (!season) {
+        if (!seasonOptions.length) {
           buildLog(
             "syncStandings",
-            `No valid season year found for league ${leagueId}`,
+            `No valid seasons found for league ${leagueId}`,
             {
-              seasonData,
+              competition:
+                competition.code,
             }
           );
-        } else {
-          buildLog(
-            "syncStandings",
-            `Resolved season ${season} for league ${leagueId}`
-          );
+
+          continue;
         }
 
-        /*
-         * ---------------------------------------------------------
-         * 3. Teams
-         * ---------------------------------------------------------
-         */
         const teamsPayload =
           await withRetry(
             () =>
@@ -664,253 +659,231 @@ if (!competitions.length) {
           }
         }
 
-        /*
-         * ---------------------------------------------------------
-         * 4. Standings
-         * ---------------------------------------------------------
-         */
-        const standingsPayload =
-          await withRetry(
-            () =>
-              requestFootballApi(
-                `/competitions/${leagueId}/standings`,
-                {}
-              )
-          );
-
-        stats.requests += 1;
-
-        const standings =
-          Array.isArray(
-            standingsPayload?.standings
-          )
-            ? standingsPayload.standings
-            : [];
-
-        if (
-          !standings.length
+        for (
+          const season of
+          seasonOptions
         ) {
-          buildLog(
-            "syncStandings",
-            `No standings returned for league ${leagueId}`,
-            {
-              season,
-            }
-          );
-        }
-
-        /*
-         * Do not create standings without a season.
-         */
-        if (!season) {
-          stats.skipped +=
-            standings.length;
-
-          buildLog(
-            "syncStandings",
-            `Skipping standings for league ${leagueId} because season could not be resolved.`
-          );
-        } else {
-          // Clean up any existing duplicate logical records for this league before syncing.
           try {
-            const dupQuery = `
-              SELECT leagueId, teamId, COALESCE(season, '') AS season, COALESCE(stage, 'overall') AS stage, COALESCE(\`group\`, 'overall') AS \`group\`, MIN(id) AS keepId, COUNT(*) AS cnt
-              FROM \`Standings\`
-              WHERE leagueId = ?
-              GROUP BY leagueId, teamId, COALESCE(season, ''), COALESCE(stage, 'overall'), COALESCE(\`group\`, 'overall')
-              HAVING COUNT(*) > 1
-            `;
+            const standingsPayload =
+              await withRetry(
+                () =>
+                  requestFootballApi(
+                    `/competitions/${leagueId}/standings`,
+                    {
+                      season,
+                    }
+                  )
+              );
 
-            const [dups] = await Standing.sequelize.query(dupQuery, { replacements: [leagueId] });
+            stats.requests += 1;
 
-            for (const dup of dups) {
-              await Standing.sequelize.query(`
-                DELETE FROM \`Standings\`
-                WHERE leagueId = ?
-                  AND teamId = ?
-                  AND COALESCE(season, '') = ?
-                  AND COALESCE(stage, 'overall') = ?
-                  AND COALESCE(\`group\`, 'overall') = ?
-                  AND id != ?
-              `, {
-                replacements: [dup.leagueId, dup.teamId, dup.season, dup.stage, dup.group, dup.keepId],
-              });
-            }
-
-            // Normalize remaining NULL group values to empty string for this league so uniqueness works reliably
-            await Standing.sequelize.query(`
-              UPDATE \`Standings\`
-              SET \`group\` = ''
-              WHERE leagueId = ? AND \`group\` IS NULL
-            `, { replacements: [leagueId] });
-          } catch (dedupeError) {
-            buildLog("syncStandings", `Failed to dedupe standings for league ${leagueId}`, { error: dedupeError.message });
-          }
-
-          for (
-            const table of
-            standings
-          ) {
-            const rows =
+            const standings =
               Array.isArray(
-                table?.table
+                standingsPayload?.standings
               )
-                ? table.table
+                ? standingsPayload.standings
                 : [];
 
-            const stage =
-              normalizeString(
-                table?.stage
-              );
-
-            const groupName =
-              normalizeString(
-                table?.group
-              );
-
-            for (
-              const row of
-              rows
+            if (
+              !standings.length
             ) {
-              try {
-                const values =
-                  buildStandingPayload(
-                    row,
-                    leagueId,
-                    season,
-                    stage,
-                    groupName
-                  );
-
-                if (
-                  !values.teamId
-                ) {
-                  stats.skipped +=
-                    1;
-
-                  continue;
+              buildLog(
+                "syncStandings",
+                `No standings returned for league ${leagueId} in season ${season}`,
+                {
+                  season,
                 }
+              );
 
-                // Ensure the referenced Team exists before creating/updating a Standing.
-                try {
-                  const foundTeam = await Team.findOne({ where: { teamId: values.teamId } });
-                  if (!foundTeam && row?.team) {
-                    const teamValues = buildTeamPayload(row.team, leagueId);
-                    await upsertTeam(teamValues);
-                  }
-                } catch (teamError) {
-                  buildLog("syncStandings", `Failed to ensure team exists for ${values.teamId}`, { error: teamError.message });
-                }
-
-                const existing =
-                  await Standing.findOne({
-                    where: {
-                      leagueId:
-                        values.leagueId,
-
-                      teamId:
-                        values.teamId,
-
-                      season:
-                        values.season,
-
-                      stage:
-                        values.stage,
-
-                      group:
-                        values.group,
-                    },
-                  });
-
-                if (
-                  existing
-                ) {
-                  await existing.update(
-                    values
-                  );
-
-                  stats.updated +=
-                    1;
-                } else {
-                  await Standing.create(
-                    values
-                  );
-
-                  stats.created +=
-                    1;
-                }
-              } catch (
-                error
-              ) {
-                stats.errors +=
-                  1;
-
-                buildLog(
-                  "syncStandings",
-                  `Failed to sync standing for team ${row?.team?.name || row?.team?.id || "unknown"}`,
-                  {
-                    leagueId,
-                    season,
-                    error:
-                      error.message,
-                  }
-                );
-              }
+              continue;
             }
-          }
-        }
 
-        /*
-         * ---------------------------------------------------------
-         * 5. Save current season
-         * ---------------------------------------------------------
-         */
-        if (
-          seasonData &&
-          season
-        ) {
-          try {
+            const seasonData =
+              competitionPayload?.seasons?.find(
+                (item) =>
+                  getApplicationSeason(item) === season
+              ) ||
+              competitionPayload?.currentSeason ||
+              competitionPayload?.season ||
+              null;
+
             const seasonValues =
+              seasonData &&
               buildSeasonPayload(
                 seasonData,
                 leagueId,
-                canonicalizeSeason(season)
+                season
               );
 
-            const existing =
-              await Season.findOne({
-                where: {
-                  leagueId,
-                  season,
-                },
-              });
+            if (
+              seasonValues
+            ) {
+              const existingSeason =
+                await Season.findOne({
+                  where: {
+                    leagueId,
+                    season,
+                  },
+                });
 
-            if (existing) {
-              await existing.update(
-                seasonValues
-              );
+              if (existingSeason) {
+                await existingSeason.update(
+                  seasonValues
+                );
+              } else {
+                await Season.create(
+                  seasonValues
+                );
+              }
+            }
 
-              stats.updated +=
-                1;
-            } else {
-              await Season.create(
-                seasonValues
-              );
+            try {
+              const dupQuery = `
+                SELECT leagueId, teamId, COALESCE(season, '') AS season, COALESCE(stage, 'overall') AS stage, COALESCE(\`group\`, 'overall') AS \`group\`, MIN(id) AS keepId, COUNT(*) AS cnt
+                FROM \`Standings\`
+                WHERE leagueId = ? AND season = ?
+                GROUP BY leagueId, teamId, COALESCE(season, ''), COALESCE(stage, 'overall'), COALESCE(\`group\`, 'overall')
+                HAVING COUNT(*) > 1
+              `;
 
-              stats.created +=
-                1;
+              const [dups] = await Standing.sequelize.query(dupQuery, { replacements: [leagueId, season] });
+
+              for (const dup of dups) {
+                await Standing.sequelize.query(`
+                  DELETE FROM \`Standings\`
+                  WHERE leagueId = ?
+                    AND teamId = ?
+                    AND COALESCE(season, '') = ?
+                    AND COALESCE(stage, 'overall') = ?
+                    AND COALESCE(\`group\`, 'overall') = ?
+                    AND id != ?
+                `, {
+                  replacements: [dup.leagueId, dup.teamId, dup.season, dup.stage, dup.group, dup.keepId],
+                });
+              }
+            } catch (dedupeError) {
+              buildLog("syncStandings", `Failed to dedupe standings for league ${leagueId} in season ${season}`, { error: dedupeError.message });
+            }
+
+            for (
+              const table of
+              standings
+            ) {
+              const rows =
+                Array.isArray(
+                  table?.table
+                )
+                  ? table.table
+                  : [];
+
+              const stage =
+                normalizeString(
+                  table?.stage
+                );
+
+              const groupName =
+                normalizeString(
+                  table?.group
+                );
+
+              for (
+                const row of
+                rows
+              ) {
+                try {
+                  const values =
+                    buildStandingPayload(
+                      row,
+                      leagueId,
+                      season,
+                      stage,
+                      groupName
+                    );
+
+                  if (
+                    !values.teamId
+                  ) {
+                    stats.skipped +=
+                      1;
+
+                    continue;
+                  }
+
+                  try {
+                    const foundTeam = await Team.findOne({ where: { teamId: values.teamId } });
+                    if (!foundTeam && row?.team) {
+                      const teamValues = buildTeamPayload(row.team, leagueId);
+                      await upsertTeam(teamValues);
+                    }
+                  } catch (teamError) {
+                    buildLog("syncStandings", `Failed to ensure team exists for ${values.teamId}`, { error: teamError.message });
+                  }
+
+                  const existing =
+                    await Standing.findOne({
+                      where: {
+                        leagueId:
+                          values.leagueId,
+
+                        teamId:
+                          values.teamId,
+
+                        season:
+                          values.season,
+
+                        stage:
+                          values.stage,
+
+                        group:
+                          values.group,
+                      },
+                    });
+
+                  if (
+                    existing
+                  ) {
+                    await existing.update(
+                      values
+                    );
+
+                    stats.updated +=
+                      1;
+                  } else {
+                    await Standing.create(
+                      values
+                    );
+
+                    stats.created +=
+                      1;
+                  }
+                } catch (
+                  error
+                ) {
+                  stats.errors +=
+                    1;
+
+                  buildLog(
+                    "syncStandings",
+                    `Failed to sync standing for team ${row?.team?.name || row?.team?.id || "unknown"}`,
+                    {
+                      leagueId,
+                      season,
+                      error:
+                        error.message,
+                    }
+                  );
+                }
+              }
             }
           } catch (
             error
           ) {
-            stats.errors +=
-              1;
+            stats.errors += 1;
 
             buildLog(
               "syncStandings",
-              `Failed to save season ${season}`,
+              `Failed to refresh standings for league ${leagueId} in season ${season}`,
               {
-                leagueId,
                 error:
                   error.message,
               }

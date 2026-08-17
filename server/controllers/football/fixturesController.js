@@ -35,10 +35,10 @@ export const getFixtures = async (req, res) => {
 
     const where = {};
     const searchTerm = String(search || team || "").trim();
-    const normalizedStatus = status === undefined ? "SCHEDULED" : String(status).trim();
+    const normalizedStatus = status ? String(status).trim().toUpperCase() : null;
 
     if (normalizedStatus) {
-      where.status = normalizedStatus.toUpperCase();
+      where.status = normalizedStatus;
     }
 
     if (season) {

@@ -23,22 +23,47 @@ const { Match } = db;
 
 /**
  * ============================================================
- * CURRENT SEASON
+ * COMPETITION SEASONS
  * ============================================================
  */
 
-const getCurrentSeason = () => {
-  const now = new Date();
+const getCompetitionSeasons = async (leagueId) => {
+  const competitionPayload = await withRetry(() =>
+    requestFootballApi(`/competitions/${leagueId}`, {})
+  );
 
-  const year =
-    now.getUTCFullYear();
+  const seasons = Array.isArray(competitionPayload?.seasons)
+    ? competitionPayload.seasons
+    : [];
 
-  const month =
-    now.getUTCMonth() + 1;
+  const candidateSeasons = [
+    ...(seasons.length
+      ? seasons.map((season) => getApplicationSeason(season))
+      : []),
+    getApplicationSeason(competitionPayload?.currentSeason || competitionPayload?.season),
+  ];
 
-  return month >= 7
-    ? year
-    : year - 1;
+  return [...new Set(candidateSeasons.filter(Boolean))];
+};
+
+const isTerminalMatchStatus = (status) => {
+  const normalized = String(status || "").trim().toUpperCase();
+
+  return [
+    "FINISHED",
+    "FT",
+    "AET",
+    "PEN",
+    "COMPLETED",
+    "ENDED",
+    "DONE",
+    "RESULT",
+    "AWARDED",
+    "CANCELLED",
+    "CANCELED",
+    "POSTPONED",
+    "SUSPENDED",
+  ].includes(normalized);
 };
 
 /**
@@ -335,9 +360,6 @@ export const syncFixtures =
     const startedAt =
       Date.now();
 
-    const season =
-      getCurrentSeason();
-
     const stats = {
       requests: 0,
       competitions: 0,
@@ -406,161 +428,224 @@ export const syncFixtures =
           competition.id
         );
 
+      let seasons = [];
+
       try {
-        /**
-         * Do NOT use:
-         *
-         * status: "SCHEDULED"
-         *
-         * because this would prevent us from
-         * detecting postponed/cancelled fixtures.
-         *
-         * We request the current season and let
-         * the API return the season's matches.
-         */
-        const payload =
-          await withRetry(() =>
-            requestFootballApi(
-              `/competitions/${leagueId}/matches`,
-              {
-                season,
-              }
-            )
+        seasons =
+          await getCompetitionSeasons(
+            leagueId
           );
-
-        stats.requests += 1;
-
-        const matches =
-          Array.isArray(
-            payload?.matches
-          )
-            ? payload.matches
-            : [];
-
-        stats.matchesReceived +=
-          matches.length;
-
-        buildLog(
-          "syncFixtures",
-          `Received ${matches.length} match(es)`,
-          {
-            competition:
-              competition.code,
-
-            leagueId,
-
-            season,
-          }
-        );
-
-        for (
-          const item of matches
-        ) {
-          try {
-            const values =
-              buildMatchPayload(
-                item,
-                leagueId
-              );
-
-            if (
-              !values.matchId
-            ) {
-              stats.skipped += 1;
-              continue;
-            }
-
-            if (
-              !values.homeTeamId ||
-              !values.awayTeamId
-            ) {
-              stats.skipped += 1;
-
-              buildLog(
-                "syncFixtures",
-                "Skipping match because a team is missing",
-                {
-                  matchId:
-                    values.matchId,
-
-                  homeTeamId:
-                    values.homeTeamId,
-
-                  awayTeamId:
-                    values.awayTeamId,
-                }
-              );
-
-              continue;
-            }
-
-            if (
-              !values.season
-            ) {
-              stats.skipped += 1;
-              continue;
-            }
-
-            const result =
-              await upsertMatch(
-                values
-              );
-
-            if (
-              result.created
-            ) {
-              stats.created += 1;
-            }
-
-            if (
-              result.updated
-            ) {
-              stats.updated += 1;
-            }
-          } catch (
-            error
-          ) {
-            stats.errors += 1;
-
-            buildLog(
-              "syncFixtures",
-              "Failed to synchronize match",
-              {
-                matchId:
-                  item?.id,
-
-                competition:
-                  competition.code,
-
-                error:
-                  error?.message,
-              }
-            );
-          }
-        }
-      } catch (
-        error
-      ) {
+      } catch (error) {
         stats.errors += 1;
 
         buildLog(
           "syncFixtures",
-          "Competition fixture sync failed",
+          "Failed to resolve competition seasons",
           {
             competition:
               competition.code,
 
             leagueId,
-
-            season,
 
             error:
               error?.message,
           }
         );
+
+        seasons = [];
       }
 
-      await sleep(1000);
+      if (
+        !seasons.length
+      ) {
+        const fallbackSeason =
+          getApplicationSeason(
+            competition.currentSeason
+          );
+
+        if (fallbackSeason) {
+          seasons = [fallbackSeason];
+        }
+      }
+
+      if (
+        !seasons.length
+      ) {
+        buildLog(
+          "syncFixtures",
+          `Skipping fixture sync for ${competition.code} because no seasons were resolved`,
+          {
+            leagueId,
+          }
+        );
+
+        continue;
+      }
+
+      for (
+        const season of seasons
+      ) {
+        try {
+          const payload =
+            await withRetry(() =>
+              requestFootballApi(
+                `/competitions/${leagueId}/matches`,
+                {
+                  season,
+                }
+              )
+            );
+
+          stats.requests += 1;
+
+          const matches =
+            Array.isArray(
+              payload?.matches
+            )
+              ? payload.matches
+              : [];
+
+          stats.matchesReceived +=
+            matches.length;
+
+          buildLog(
+            "syncFixtures",
+            `Received ${matches.length} match(es)`,
+            {
+              competition:
+                competition.code,
+
+              leagueId,
+
+              season,
+            }
+          );
+
+          for (
+            const item of matches
+          ) {
+            try {
+              const values =
+                buildMatchPayload(
+                  item,
+                  leagueId
+                );
+
+              if (
+                !values.matchId
+              ) {
+                stats.skipped += 1;
+                continue;
+              }
+
+              if (
+                !values.homeTeamId ||
+                !values.awayTeamId
+              ) {
+                stats.skipped += 1;
+
+                buildLog(
+                  "syncFixtures",
+                  "Skipping match because a team is missing",
+                  {
+                    matchId:
+                      values.matchId,
+
+                    homeTeamId:
+                      values.homeTeamId,
+
+                    awayTeamId:
+                      values.awayTeamId,
+                  }
+                );
+
+                continue;
+              }
+
+              if (
+                !values.season
+              ) {
+                stats.skipped += 1;
+                continue;
+              }
+
+              const result =
+                await upsertMatch(
+                  values
+                );
+
+              if (
+                result.created
+              ) {
+                stats.created += 1;
+              }
+
+              if (
+                result.updated
+              ) {
+                stats.updated += 1;
+              }
+
+              if (
+                isTerminalMatchStatus(
+                  values.status
+                )
+              ) {
+                const {
+                  evaluatePredictionResults,
+                } = await import(
+                  "./predictionEvaluator.js"
+                );
+
+                await evaluatePredictionResults(
+                  values.matchId
+                );
+              }
+            } catch (
+              error
+            ) {
+              stats.errors += 1;
+
+              buildLog(
+                "syncFixtures",
+                "Failed to synchronize match",
+                {
+                  matchId:
+                    item?.id,
+
+                  competition:
+                    competition.code,
+
+                  error:
+                    error?.message,
+                }
+              );
+            }
+          }
+        } catch (
+          error
+        ) {
+          stats.errors += 1;
+
+          buildLog(
+            "syncFixtures",
+            "Competition fixture sync failed",
+            {
+              competition:
+                competition.code,
+
+              leagueId,
+
+              season,
+
+              error:
+                error?.message,
+            }
+          );
+        }
+
+        await sleep(1000);
+      }
     }
 
     buildLog(
@@ -568,8 +653,6 @@ export const syncFixtures =
       "Fixture synchronization completed",
       {
         ...stats,
-
-        season,
 
         durationMs:
           Date.now() -

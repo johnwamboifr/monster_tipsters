@@ -139,10 +139,27 @@ const buildTeamPayload = (
     values.leagueId
   );
 
-  const leagueChanged =
-    oldLeagueId !== newLeagueId;
+  const nextValues = {
+    ...values,
+  };
 
-  await existing.update(values);
+  if (
+    oldLeagueId &&
+    oldLeagueId !== newLeagueId
+  ) {
+    nextValues.leagueId =
+      oldLeagueId;
+  }
+
+  const leagueChanged =
+    normalizeString(
+      existing.leagueId
+    ) !==
+    normalizeString(
+      nextValues.leagueId
+    );
+
+  await existing.update(nextValues);
 
   return {
     record: existing,
